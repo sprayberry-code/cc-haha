@@ -848,7 +848,7 @@ describe('WebSocket handler session isolation', () => {
       outputCallbacks.delete(callback)
     })
     spyOn(sessionService, 'getCustomTitle').mockResolvedValue('Existing title')
-    spyOn(sessionService, 'appendSessionTaskNotification').mockResolvedValue()
+    const append = spyOn(sessionService, 'appendSessionTaskNotification').mockResolvedValue()
     spyOn(conversationService, 'sendMessage').mockImplementation(
       () => new Promise<boolean>((resolve) => {
         resolveSend = resolve
@@ -858,6 +858,7 @@ describe('WebSocket handler session isolation', () => {
 
     return {
       ws,
+      append,
       emit: async (cliMsg: any) => {
         for (const callback of [...outputCallbacks]) callback(cliMsg)
         await flushMicrotasks(30)
@@ -950,6 +951,35 @@ describe('WebSocket handler session isolation', () => {
     }
     expect(session.ws.sent.map((payload) => JSON.parse(payload))).toContainEqual(expected)
     expect(observer.sent.map((payload) => JSON.parse(payload))).toContainEqual(expected)
+    expect(session.append).toHaveBeenCalledTimes(1)
+    expect(session.append).toHaveBeenCalledWith(
+      sessionId,
+      expect.objectContaining({ taskId: 'two-client-task', status: 'completed' }),
+    )
+
+    await session.settle()
+  })
+
+  it('forwards a background task terminal past the stop fence during a foreground admission', async () => {
+    const session = openAdmissionWindow(`task-terminal-stop-during-admission-${crypto.randomUUID()}`)
+    spyOn(conversationService, 'sendInterrupt').mockReturnValue(true)
+
+    await session.emit(backgroundTaskStarted('stop-fenced-task'))
+    await session.admit('Ask something while the background command is running')
+    handleWebSocket.message(session.ws, JSON.stringify({ type: 'stop_generation' }))
+    await flushMicrotasks(30)
+    session.ws.sent.length = 0
+    await session.emit(backgroundTaskNotification('stop-fenced-task', 'completed'))
+    await session.emit({
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'late text from the stopped turn' }] },
+    })
+
+    expect(session.ws.sent.map((payload) => JSON.parse(payload))).toEqual([{
+      type: 'system_notification',
+      subtype: 'task_notification',
+      data: expect.objectContaining({ task_id: 'stop-fenced-task', status: 'completed' }),
+    }])
 
     await session.settle()
   })
