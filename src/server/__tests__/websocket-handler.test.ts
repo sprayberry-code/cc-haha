@@ -835,8 +835,7 @@ describe('WebSocket handler session isolation', () => {
     await flushMicrotasks(30)
   })
 
-  it('forwards background task completion while a foreground admission awaits send acknowledgement', async () => {
-    const sessionId = `task-notification-during-admission-${crypto.randomUUID()}`
+  function openAdmissionWindow(sessionId: string) {
     const ws = makeClientSocket(sessionId)
     const outputCallbacks = new Set<(cliMsg: any) => void>()
     let resolveSend!: (sent: boolean) => void
@@ -855,93 +854,19 @@ describe('WebSocket handler session isolation', () => {
         resolveSend = resolve
       }),
     )
-
     handleWebSocket.open(ws)
-    for (const callback of [...outputCallbacks]) {
-      callback({
-        type: 'system',
-        subtype: 'task_started',
-        task_id: 'admission-bash-task',
-        tool_use_id: 'admission-bash-tool',
-        description: 'bun test',
-        task_type: 'bash',
-      })
-    }
-
-    handleWebSocket.message(ws, JSON.stringify({
-      type: 'user_message',
-      content: 'Ask something while the background command is running',
-    }))
-    await flushMicrotasks(30)
-    ws.sent.length = 0
-
-    for (const callback of [...outputCallbacks]) {
-      callback({
-        type: 'system',
-        subtype: 'task_notification',
-        task_id: 'admission-bash-task',
-        tool_use_id: 'admission-bash-tool',
-        status: 'completed',
-        summary: 'Background command "bun test" completed',
-        task_type: 'bash',
-      })
-    }
-    await flushMicrotasks(30)
-
-    expect(ws.sent.map((payload) => JSON.parse(payload))).toContainEqual({
-      type: 'system_notification',
-      subtype: 'task_notification',
-      data: expect.objectContaining({
-        task_id: 'admission-bash-task',
-        status: 'completed',
-      }),
-    })
-
-    resolveSend(true)
-    await flushMicrotasks(30)
-  })
-
-  async function openAdmissionWindow(sessionId: string) {
-    const ws = makeClientSocket(sessionId)
-    const outputCallbacks = new Set<(cliMsg: any) => void>()
-    let resolveSend!: (sent: boolean) => void
-    spyOn(conversationService, 'hasSession').mockReturnValue(true)
-    spyOn(conversationService, 'getPendingPermissionRequests').mockReturnValue([])
-    spyOn(conversationService, 'onOutput').mockImplementation((_sid, callback) => {
-      outputCallbacks.add(callback)
-    })
-    spyOn(conversationService, 'removeOutputCallback').mockImplementation((_sid, callback) => {
-      outputCallbacks.delete(callback)
-    })
-    spyOn(sessionService, 'getCustomTitle').mockResolvedValue('Existing title')
-    spyOn(sessionService, 'appendSessionTaskNotification').mockResolvedValue()
-    spyOn(conversationService, 'sendMessage').mockImplementation(
-      () => new Promise<boolean>((resolve) => {
-        resolveSend = resolve
-      }),
-    )
-
-    const emit = async (cliMsg: any) => {
-      for (const callback of [...outputCallbacks]) callback(cliMsg)
-      await flushMicrotasks(30)
-    }
 
     return {
       ws,
-      emit,
-      attachSecondClient: (second: ReturnType<typeof makeClientSocket>) => {
-        handleWebSocket.open(second)
-      },
-      open: () => {
-        handleWebSocket.open(ws)
+      emit: async (cliMsg: any) => {
+        for (const callback of [...outputCallbacks]) callback(cliMsg)
+        await flushMicrotasks(30)
       },
       admit: async (content: string) => {
         handleWebSocket.message(ws, JSON.stringify({ type: 'user_message', content }))
         await flushMicrotasks(30)
         ws.sent.length = 0
       },
-      sentBy: (socket: ReturnType<typeof makeClientSocket>) =>
-        socket.sent.map((payload) => JSON.parse(payload)),
       settle: async () => {
         resolveSend(true)
         await flushMicrotasks(30)
@@ -949,106 +874,55 @@ describe('WebSocket handler session isolation', () => {
     }
   }
 
-  for (const status of ['failed', 'stopped', 'killed'] as const) {
-    it(`forwards a background task '${status}' terminal while a foreground admission awaits send acknowledgement`, async () => {
-      const sessionId = `task-${status}-during-admission-${crypto.randomUUID()}`
-      const session = await openAdmissionWindow(sessionId)
+  const backgroundTaskStarted = (taskId: string) => ({
+    type: 'system',
+    subtype: 'task_started',
+    task_id: taskId,
+    tool_use_id: `${taskId}-tool`,
+    description: 'bun test',
+    task_type: 'bash',
+  })
 
-      session.open()
-      await session.emit({
-        type: 'system',
-        subtype: 'task_started',
-        task_id: `admission-${status}-task`,
-        tool_use_id: `admission-${status}-tool`,
-        description: 'bun test',
-        task_type: 'bash',
-      })
+  const backgroundTaskNotification = (taskId: string, status: string) => ({
+    type: 'system',
+    subtype: 'task_notification',
+    task_id: taskId,
+    tool_use_id: `${taskId}-tool`,
+    status,
+    summary: `Background command "bun test" ${status}`,
+    task_type: 'bash',
+  })
+
+  for (const status of ['completed', 'failed', 'stopped', 'killed', 'running'] as const) {
+    it(`forwards a background task '${status}' notification while a foreground admission awaits send acknowledgement`, async () => {
+      const session = openAdmissionWindow(`task-${status}-during-admission-${crypto.randomUUID()}`)
+
+      await session.emit(backgroundTaskStarted(`admission-${status}-task`))
       await session.admit('Ask something while the background command is running')
+      await session.emit(backgroundTaskNotification(`admission-${status}-task`, status))
 
-      await session.emit({
-        type: 'system',
-        subtype: 'task_notification',
-        task_id: `admission-${status}-task`,
-        tool_use_id: `admission-${status}-tool`,
-        status,
-        summary: `Background command "bun test" ${status}`,
-        task_type: 'bash',
-      })
-
-      expect(session.sentBy(session.ws)).toContainEqual({
+      expect(session.ws.sent.map((payload) => JSON.parse(payload))).toContainEqual({
         type: 'system_notification',
         subtype: 'task_notification',
-        data: expect.objectContaining({
-          task_id: `admission-${status}-task`,
-          status,
-        }),
+        data: expect.objectContaining({ task_id: `admission-${status}-task`, status }),
       })
 
       await session.settle()
     })
   }
 
-  it('forwards a background task heartbeat notification during a foreground admission', async () => {
-    const sessionId = `task-running-during-admission-${crypto.randomUUID()}`
-    const session = await openAdmissionWindow(sessionId)
-
-    session.open()
-    await session.emit({
-      type: 'system',
-      subtype: 'task_started',
-      task_id: 'admission-running-task',
-      tool_use_id: 'admission-running-tool',
-      description: 'bun test',
-      task_type: 'bash',
-    })
-    await session.admit('Ask something while the background command is running')
-
-    await session.emit({
-      type: 'system',
-      subtype: 'task_notification',
-      task_id: 'admission-running-task',
-      tool_use_id: 'admission-running-tool',
-      status: 'running',
-      summary: 'Background work continues independently',
-      task_type: 'bash',
-    })
-
-    expect(session.sentBy(session.ws)).toContainEqual({
-      type: 'system_notification',
-      subtype: 'task_notification',
-      data: expect.objectContaining({
-        task_id: 'admission-running-task',
-        status: 'running',
-      }),
-    })
-
-    await session.settle()
-  })
-
   it('forwards a background task that starts inside the foreground admission window', async () => {
-    const sessionId = `task-started-inside-admission-${crypto.randomUUID()}`
-    const session = await openAdmissionWindow(sessionId)
+    const session = openAdmissionWindow(`task-started-inside-admission-${crypto.randomUUID()}`)
 
-    session.open()
     await session.admit('Ask something before any background command exists')
+    await session.emit(backgroundTaskStarted('inside-admission-task'))
 
-    await session.emit({
-      type: 'system',
-      subtype: 'task_started',
-      task_id: 'inside-admission-task',
-      tool_use_id: 'inside-admission-tool',
-      description: 'bun test',
-      task_type: 'bash',
-    })
-
-    const sent = session.sentBy(session.ws)
+    const sent = session.ws.sent.map((payload) => JSON.parse(payload))
     expect(sent).toContainEqual(expect.objectContaining({
       type: 'system_notification',
       subtype: 'task_started',
       data: expect.objectContaining({ task_id: 'inside-admission-task' }),
     }))
-    // A task starting inside the admission window now also drives the activity
-    // verb, exactly as one starting outside it already did.
     expect(sent).toContainEqual({
       type: 'status',
       state: 'tool_executing',
@@ -1060,62 +934,38 @@ describe('WebSocket handler session isolation', () => {
 
   it('forwards a background task terminal to every client bound to the session during one admission', async () => {
     const sessionId = `task-notification-two-clients-${crypto.randomUUID()}`
-    const session = await openAdmissionWindow(sessionId)
+    const session = openAdmissionWindow(sessionId)
     const observer = makeClientSocket(sessionId)
+    handleWebSocket.open(observer)
 
-    session.open()
-    session.attachSecondClient(observer)
-    await session.emit({
-      type: 'system',
-      subtype: 'task_started',
-      task_id: 'two-client-task',
-      tool_use_id: 'two-client-tool',
-      description: 'bun test',
-      task_type: 'bash',
-    })
+    await session.emit(backgroundTaskStarted('two-client-task'))
     await session.admit('Ask something while both renderers watch')
     observer.sent.length = 0
-
-    await session.emit({
-      type: 'system',
-      subtype: 'task_notification',
-      task_id: 'two-client-task',
-      tool_use_id: 'two-client-tool',
-      status: 'completed',
-      summary: 'Background command "bun test" completed',
-      task_type: 'bash',
-    })
+    await session.emit(backgroundTaskNotification('two-client-task', 'completed'))
 
     const expected = {
       type: 'system_notification',
       subtype: 'task_notification',
       data: expect.objectContaining({ task_id: 'two-client-task', status: 'completed' }),
     }
-    expect(session.sentBy(session.ws)).toContainEqual(expected)
-    expect(session.sentBy(observer)).toContainEqual(expected)
+    expect(session.ws.sent.map((payload) => JSON.parse(payload))).toContainEqual(expected)
+    expect(observer.sent.map((payload) => JSON.parse(payload))).toContainEqual(expected)
 
     await session.settle()
   })
 
-  it('keeps a stopped Agent unrevived by a late terminal during a foreground admission (control)', async () => {
+  it('keeps a stopped Agent unrevived by a late terminal during a foreground admission', async () => {
     const sessionId = `stopped-agent-during-admission-${crypto.randomUUID()}`
-    const session = await openAdmissionWindow(sessionId)
+    const session = openAdmissionWindow(sessionId)
 
-    session.open()
     markTaskAuthoritativelyStopped(sessionId, 'authoritatively-stopped-task')
     await session.admit('Ask something after the Agent was stopped')
-
     await session.emit({
-      type: 'system',
-      subtype: 'task_notification',
-      task_id: 'authoritatively-stopped-task',
-      tool_use_id: 'authoritatively-stopped-tool',
-      status: 'completed',
-      summary: 'Late terminal for an Agent already bookended as stopped',
+      ...backgroundTaskNotification('authoritatively-stopped-task', 'completed'),
       task_type: 'local_agent',
     })
 
-    expect(session.sentBy(session.ws)).not.toContainEqual(expect.objectContaining({
+    expect(session.ws.sent.map((payload) => JSON.parse(payload))).not.toContainEqual(expect.objectContaining({
       type: 'system_notification',
       subtype: 'task_notification',
     }))
@@ -1123,37 +973,27 @@ describe('WebSocket handler session isolation', () => {
     await session.settle()
   })
 
-  it('keeps non-lifecycle task chatter muted during a foreground admission (control)', async () => {
-    const sessionId = `task-chatter-during-admission-${crypto.randomUUID()}`
-    const session = await openAdmissionWindow(sessionId)
+  it('keeps non-lifecycle task chatter muted during a foreground admission', async () => {
+    const session = openAdmissionWindow(`task-chatter-during-admission-${crypto.randomUUID()}`)
 
-    session.open()
-    await session.emit({
-      type: 'system',
-      subtype: 'task_started',
-      task_id: 'muted-chatter-task',
-      tool_use_id: 'muted-chatter-tool',
-      description: 'bun test',
-      task_type: 'bash',
-    })
+    await session.emit(backgroundTaskStarted('muted-chatter-task'))
     await session.admit('Ask something while the background command is running')
 
-    const mutedDuringAdmission = [
+    for (const event of [
       { subtype: 'task_progress', task_id: 'muted-chatter-task', summary: 'still running' },
       { subtype: 'task_notification', task_id: 'muted-chatter-task', status: 'paused' },
       { subtype: 'task_notification', task_id: '', status: 'completed' },
       { subtype: 'task_notification', task_id: '   ', status: 'completed' },
-    ]
-    for (const event of mutedDuringAdmission) {
+    ]) {
       await session.emit({
         type: 'system',
-        tool_use_id: 'muted-chatter-tool',
+        tool_use_id: 'muted-chatter-task-tool',
         task_type: 'bash',
         ...event,
       })
     }
 
-    expect(session.sentBy(session.ws)).toEqual([])
+    expect(session.ws.sent).toEqual([])
 
     await session.settle()
   })
