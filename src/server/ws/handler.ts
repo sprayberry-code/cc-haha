@@ -4275,12 +4275,6 @@ function bindClientSessionOutput(
       options?.shouldForward &&
       !options.shouldForward(cliMsg)
     ) {
-      // The pre-turn mute gate exists to keep pre-turn SDK chatter out of the
-      // new turn's history. Background task lifecycle is not chatter: a task
-      // started before this turn still owes the renderer its terminal
-      // notification, and dropping it here strands the task card as running
-      // forever. The stop fence above already exempts lifecycle for the same
-      // reason.
       return
     }
 
