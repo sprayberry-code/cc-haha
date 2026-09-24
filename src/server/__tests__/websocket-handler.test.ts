@@ -832,6 +832,70 @@ describe('WebSocket handler session isolation', () => {
     await flushMicrotasks(30)
   })
 
+  it('forwards background task lifecycle while a foreground admission awaits send acknowledgement', async () => {
+    const sessionId = `task-lifecycle-during-admission-${crypto.randomUUID()}`
+    const ws = makeClientSocket(sessionId)
+    const observer = makeClientSocket(sessionId)
+    const outputCallbacks = new Set<(cliMsg: any) => void>()
+    let resolveSend!: (sent: boolean) => void
+    spyOn(conversationService, 'hasSession').mockReturnValue(true)
+    spyOn(conversationService, 'getPendingPermissionRequests').mockReturnValue([])
+    spyOn(conversationService, 'onOutput').mockImplementation((_sid, callback) => {
+      outputCallbacks.add(callback)
+    })
+    spyOn(conversationService, 'removeOutputCallback').mockImplementation((_sid, callback) => {
+      outputCallbacks.delete(callback)
+    })
+    spyOn(sessionService, 'getCustomTitle').mockResolvedValue('Existing title')
+    const append = spyOn(sessionService, 'appendSessionTaskNotification').mockResolvedValue()
+    spyOn(conversationService, 'sendMessage').mockImplementation(
+      () => new Promise<boolean>((resolve) => {
+        resolveSend = resolve
+      }),
+    )
+    const task = (subtype: string, taskId: string, fields: Record<string, string> = {}) => ({
+      type: 'system',
+      subtype,
+      uuid: `${taskId}-${subtype}-${fields.status ?? ''}`,
+      task_id: taskId,
+      tool_use_id: `${taskId}-tool`,
+      task_type: 'bash',
+      ...fields,
+    })
+    const emit = async (cliMsg: any) => {
+      ws.sent.length = 0
+      observer.sent.length = 0
+      for (const callback of [...outputCallbacks]) callback(cliMsg)
+      await flushMicrotasks(30)
+      return [ws, observer].map((client) => client.sent.map((payload) => JSON.parse(payload)))
+    }
+
+    handleWebSocket.open(ws)
+    handleWebSocket.open(observer)
+    await emit(task('task_started', 'shell', { description: 'bun test' }))
+    await emit(task('task_started', 'agent', { description: 'review', task_type: 'local_agent' }))
+    handleWebSocket.message(ws, JSON.stringify({ type: 'user_message', content: 'Ask while commands run' }))
+    await flushMicrotasks(30)
+
+    for (const [taskId, status, taskType] of [['shell', 'completed', 'bash'], ['agent', 'failed', 'local_agent']]) {
+      for (const sent of await emit(task('task_notification', taskId, { status, task_type: taskType }))) {
+        expect(sent).toContainEqual({
+          type: 'system_notification',
+          subtype: 'task_notification',
+          data: expect.objectContaining({ task_id: taskId, status }),
+        })
+      }
+    }
+    expect(append).toHaveBeenCalledTimes(2)
+    for (const sent of await emit(task('task_started', 'inside', { description: 'bun test' }))) {
+      expect(sent).toContainEqual(expect.objectContaining({ subtype: 'task_started' }))
+    }
+    expect(await emit(task('task_progress', 'inside', { summary: 'still running' }))).toEqual([[], []])
+
+    resolveSend(true)
+    await flushMicrotasks(30)
+  })
+
   it('lets directed Agent terminals through the stop fence after suppressing late content', () => {
     const sessionId = `agent-run-terminal-after-stop-${crypto.randomUUID()}`
     const ws = makeClientSocket(sessionId)
