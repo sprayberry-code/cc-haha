@@ -873,17 +873,23 @@ describe('WebSocket handler session isolation', () => {
       await flushMicrotasks(30)
       return [ws, observer].map((client) => client.sent.map((payload) => JSON.parse(payload)))
     }
-    const statuses = ['completed', 'failed', 'stopped', 'killed', 'running']
+    const tasks = Object.entries({
+      completed: {},
+      failed: { task_type: 'local_agent' },
+      stopped: { task_type: 'remote_agent' },
+      killed: { owner_agent_id: 'lead' },
+      running: {},
+    })
 
     handleWebSocket.open(ws)
     handleWebSocket.open(observer)
-    for (const status of statuses) await emit(task('task_started', `${status}-task`, { description: 'bun test' }))
+    for (const [status, fields] of tasks) await emit(task('task_started', `${status}-task`, { description: 'bun test', ...fields }))
     markTaskAuthoritativelyStopped(sessionId, 'stopped-agent')
     handleWebSocket.message(ws, JSON.stringify({ type: 'user_message', content: 'Ask while commands run' }))
     await flushMicrotasks(30)
 
-    for (const status of statuses) {
-      for (const sent of await emit(task('task_notification', `${status}-task`, { status }))) {
+    for (const [status, fields] of tasks) {
+      for (const sent of await emit(task('task_notification', `${status}-task`, { status, ...fields }))) {
         expect(sent).toContainEqual({
           type: 'system_notification',
           subtype: 'task_notification',
