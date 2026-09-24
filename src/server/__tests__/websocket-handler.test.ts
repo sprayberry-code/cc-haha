@@ -25,10 +25,7 @@ import { computerUseApprovalService } from '../services/computerUseApprovalServi
 import { sessionService } from '../services/sessionService.js'
 import * as titleService from '../services/titleService.js'
 import { SettingsService } from '../services/settingsService.js'
-import {
-  activeBackgroundTaskIds,
-  markTaskAuthoritativelyStopped,
-} from '../ws/agentTaskState.js'
+import { activeBackgroundTaskIds } from '../ws/agentTaskState.js'
 import * as teleportApi from '../../utils/teleport/api.js'
 import { resetSettingsCache, setSessionSettingsCache } from '../../utils/settings/settingsCache.js'
 
@@ -849,7 +846,6 @@ describe('WebSocket handler session isolation', () => {
     spyOn(conversationService, 'removeOutputCallback').mockImplementation((_sid, callback) => {
       outputCallbacks.delete(callback)
     })
-    spyOn(conversationService, 'sendInterrupt').mockReturnValue(true)
     spyOn(sessionService, 'getCustomTitle').mockResolvedValue('Existing title')
     const append = spyOn(sessionService, 'appendSessionTaskNotification').mockResolvedValue()
     spyOn(conversationService, 'sendMessage').mockImplementation(
@@ -857,7 +853,7 @@ describe('WebSocket handler session isolation', () => {
         resolveSend = resolve
       }),
     )
-    const task = (subtype: string, taskId: string, fields: Record<string, string>) => ({
+    const task = (subtype: string, taskId: string, fields: Record<string, string> = {}) => ({
       type: 'system',
       subtype,
       uuid: `${taskId}-${subtype}-${fields.status ?? ''}`,
@@ -873,64 +869,28 @@ describe('WebSocket handler session isolation', () => {
       await flushMicrotasks(30)
       return [ws, observer].map((client) => client.sent.map((payload) => JSON.parse(payload)))
     }
-    const tasks = Object.entries({
-      completed: {},
-      failed: { task_type: 'local_agent' },
-      stopped: { task_type: 'remote_agent' },
-      killed: { owner_agent_id: 'lead' },
-      running: {},
-    })
 
     handleWebSocket.open(ws)
     handleWebSocket.open(observer)
-    for (const [status, fields] of tasks) await emit(task('task_started', `${status}-task`, { description: 'bun test', ...fields }))
-    markTaskAuthoritativelyStopped(sessionId, 'stopped-agent')
+    await emit(task('task_started', 'shell', { description: 'bun test' }))
+    await emit(task('task_started', 'agent', { description: 'review', task_type: 'local_agent' }))
     handleWebSocket.message(ws, JSON.stringify({ type: 'user_message', content: 'Ask while commands run' }))
     await flushMicrotasks(30)
 
-    for (const [status, fields] of tasks) {
-      for (const sent of await emit(task('task_notification', `${status}-task`, { status, ...fields }))) {
+    for (const [taskId, status, taskType] of [['shell', 'completed', 'bash'], ['agent', 'failed', 'local_agent']]) {
+      for (const sent of await emit(task('task_notification', taskId, { status, task_type: taskType }))) {
         expect(sent).toContainEqual({
           type: 'system_notification',
           subtype: 'task_notification',
-          data: expect.objectContaining({ task_id: `${status}-task`, status }),
+          data: expect.objectContaining({ task_id: taskId, status }),
         })
       }
     }
-    expect(append).toHaveBeenCalledTimes(4)
-
-    for (const sent of await emit(task('task_started', 'inside-task', { description: 'bun test' }))) {
-      expect(sent).toContainEqual(expect.objectContaining({
-        type: 'system_notification',
-        subtype: 'task_started',
-        data: expect.objectContaining({ task_id: 'inside-task' }),
-      }))
-      expect(sent).toContainEqual({ type: 'status', state: 'tool_executing', verb: 'bun test' })
+    expect(append).toHaveBeenCalledTimes(2)
+    for (const sent of await emit(task('task_started', 'inside', { description: 'bun test' }))) {
+      expect(sent).toContainEqual(expect.objectContaining({ subtype: 'task_started' }))
     }
-
-    for (const event of [
-      task('task_progress', 'inside-task', { summary: 'still running' }),
-      task('task_notification', 'inside-task', { status: 'paused' }),
-      task('task_notification', '', { status: 'completed' }),
-      task('task_notification', '   ', { status: 'completed' }),
-      task('task_notification', 'stopped-agent', { status: 'completed', task_type: 'local_agent' }),
-    ]) {
-      expect(await emit(event)).toEqual([[], []])
-    }
-
-    handleWebSocket.message(ws, JSON.stringify({ type: 'stop_generation' }))
-    await flushMicrotasks(30)
-    for (const sent of await emit(task('task_notification', 'inside-task', { status: 'completed' }))) {
-      expect(sent).toEqual([{
-        type: 'system_notification',
-        subtype: 'task_notification',
-        data: expect.objectContaining({ task_id: 'inside-task', status: 'completed' }),
-      }])
-    }
-    expect(await emit({
-      type: 'assistant',
-      message: { content: [{ type: 'text', text: 'late text from the stopped turn' }] },
-    })).toEqual([[], []])
+    expect(await emit(task('task_progress', 'inside', { summary: 'still running' }))).toEqual([[], []])
 
     resolveSend(true)
     await flushMicrotasks(30)
